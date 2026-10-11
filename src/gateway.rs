@@ -234,17 +234,59 @@ impl Daemon {
         }
         let names = self.commands.names(Path::new(gray_bin), &home).await;
         // Unknown name: leave the text for the normal turn.
-        let Some(&scope) = names.get(name.as_str()) else {
+        let Some(&cmd) = names.get(name.as_str()) else {
             return false;
         };
-        let cmd_home =
-            crate::commands::command_home(&self.config, &self.config_path, &conversation, scope);
-        let posted =
-            match crate::commands::run(Path::new(gray_bin), &cmd_home, &name, &args).await {
-                Ok(text) => text,
-                Err(message) => format!("_{message}_"),
-            };
-        let _ = self.rest.post_text(channel, &posted, Some(ts)).await;
+        let cmd_home = crate::commands::command_home(
+            &self.config,
+            &self.config_path,
+            &conversation,
+            cmd.scope,
+        );
+        match crate::commands::run(Path::new(gray_bin), &cmd_home, &name, &args, cmd.slow).await {
+            Ok(crate::commands::Outcome::Text(text)) => {
+                let _ = self.rest.post_text(channel, &text, Some(ts)).await;
+            }
+            Ok(crate::commands::Outcome::Prompt { prompt, fallback }) => {
+                let capacity = self
+                    .config
+                    .get("queue_capacity")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1000);
+                match self.store.enqueue(
+                    &format!("{channel}:{ts}:cmd"),
+                    channel,
+                    thread_ts,
+                    user,
+                    &conversation,
+                    &prompt,
+                    capacity,
+                ) {
+                    Ok(Some(_)) => {
+                        if !fallback.trim().is_empty() {
+                            let _ = self.rest.post_text(channel, &fallback, Some(ts)).await;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = self
+                            .rest
+                            .post_text(
+                                channel,
+                                &format!("Queue full ({e}); try again later."),
+                                Some(ts),
+                            )
+                            .await;
+                    }
+                }
+            }
+            Err(message) => {
+                let _ = self
+                    .rest
+                    .post_text(channel, &format!("_{message}_"), Some(ts))
+                    .await;
+            }
+        }
         true
     }
 

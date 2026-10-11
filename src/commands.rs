@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 const LIST_TTL: Duration = Duration::from_secs(300);
 /// Ceiling on any one `gray cmd` child.
 const CMD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Registry rows marked `slow` (compaction, plugin calls, updates) get
+/// this window instead — a posted reply has no platform deadline.
+const SLOW_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Names assumed present when `gray cmd list` cannot be read — an old
 /// binary, or a spawn failure. All conversation-scoped.
@@ -29,6 +32,14 @@ const STATIC_NAMES: &[&str] = &[
 pub enum Scope {
     Conversation,
     Global,
+}
+
+/// What the registry knows about a command: where it runs and whether it
+/// can outlast the normal timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cmd {
+    pub scope: Scope,
+    pub slow: bool,
 }
 
 /// `!name args` / `/name args` -> `(name, args)`.
@@ -66,11 +77,11 @@ pub fn parse_prefixed(text: &str, bot_user_id: &str) -> Option<(String, String)>
 pub fn dispatch(
     text: &str,
     bot_user_id: &str,
-    names: &HashMap<String, Scope>,
-) -> Option<(String, String, Scope)> {
+    names: &HashMap<String, Cmd>,
+) -> Option<(String, String, Cmd)> {
     let (name, args) = parse_prefixed(text, bot_user_id)?;
-    let scope = *names.get(&name)?;
-    Some((name, args, scope))
+    let cmd = *names.get(&name)?;
+    Some((name, args, cmd))
 }
 
 /// The home a command runs against: this conversation, or the user's main
@@ -96,7 +107,7 @@ pub fn command_home(
 pub struct Cache(Mutex<Option<Cached>>);
 
 struct Cached {
-    names: HashMap<String, Scope>,
+    names: HashMap<String, Cmd>,
     fetched: Instant,
 }
 
@@ -105,11 +116,11 @@ impl Cache {
         Cache(Mutex::new(None))
     }
 
-    /// Name -> scope for every command the binary advertises, canonical
-    /// names and aliases alike; the static allowlist when `list` fails.
-    /// A failure caches the fallback too, so a stale binary is re-probed
-    /// on the TTL rather than per message.
-    pub async fn names(&self, gray_bin: &Path, home: &Path) -> HashMap<String, Scope> {
+    /// Name -> scope/speed for every command the binary advertises,
+    /// canonical names and aliases alike; the static allowlist when `list`
+    /// fails. A failure caches the fallback too, so a stale binary is
+    /// re-probed on the TTL rather than per message.
+    pub async fn names(&self, gray_bin: &Path, home: &Path) -> HashMap<String, Cmd> {
         {
             let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(cached) = guard.as_ref() {
@@ -127,18 +138,28 @@ impl Cache {
     }
 }
 
-fn static_names() -> HashMap<String, Scope> {
+fn static_names() -> HashMap<String, Cmd> {
     STATIC_NAMES
         .iter()
-        .map(|n| (n.to_string(), Scope::Conversation))
+        .map(|n| {
+            (
+                n.to_string(),
+                Cmd {
+                    scope: Scope::Conversation,
+                    slow: false,
+                },
+            )
+        })
         .collect()
 }
 
 /// `gray cmd list` -> name/alias -> scope. Any failure is `None`; the
 /// caller swaps in the static allowlist.
-async fn list(gray_bin: &Path, home: &Path) -> Option<HashMap<String, Scope>> {
+async fn list(gray_bin: &Path, home: &Path) -> Option<HashMap<String, Cmd>> {
     ensure_home(home).ok()?;
-    let out = cmd_output(gray_bin, home, &["list"]).await.ok()?;
+    let out = cmd_output(gray_bin, home, &["list"], CMD_TIMEOUT)
+        .await
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -147,19 +168,22 @@ async fn list(gray_bin: &Path, home: &Path) -> Option<HashMap<String, Scope>> {
 }
 
 /// `result.commands[]` -> the verification map.
-fn parse_list(reply: &Value) -> Option<HashMap<String, Scope>> {
+fn parse_list(reply: &Value) -> Option<HashMap<String, Cmd>> {
     if reply.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
     }
     let commands = reply.pointer("/result/commands").and_then(Value::as_array)?;
     let mut names = HashMap::new();
     for command in commands {
-        let scope = match command.get("scope").and_then(Value::as_str) {
-            Some("global") => Scope::Global,
-            _ => Scope::Conversation,
+        let row = Cmd {
+            scope: match command.get("scope").and_then(Value::as_str) {
+                Some("global") => Scope::Global,
+                _ => Scope::Conversation,
+            },
+            slow: command.get("slow").and_then(Value::as_bool).unwrap_or(false),
         };
         if let Some(name) = command.get("name").and_then(Value::as_str) {
-            names.insert(name.to_string(), scope);
+            names.insert(name.to_string(), row);
         }
         for alias in command
             .get("aliases")
@@ -168,7 +192,7 @@ fn parse_list(reply: &Value) -> Option<HashMap<String, Scope>> {
             .flatten()
             .filter_map(Value::as_str)
         {
-            names.insert(alias.to_string(), scope);
+            names.insert(alias.to_string(), row);
         }
     }
     if names.is_empty() {
@@ -178,17 +202,32 @@ fn parse_list(reply: &Value) -> Option<HashMap<String, Scope>> {
     }
 }
 
-/// `gray cmd run <name> [args]` in `home` -> the text to post back.
-/// `kind:"text"` answers the markdown body; `kind:"ui"` — Slack v1 has no
-/// components — answers the `fallback_text` render; `!ok` surfaces the
-/// wire's error message.
-pub async fn run(gray_bin: &Path, home: &Path, name: &str, args: &str) -> Result<String, String> {
+/// What a `cmd run` answer becomes: text to post, or a prompt the caller
+/// queues as a turn in this conversation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Text(String),
+    Prompt { prompt: String, fallback: String },
+}
+
+/// `gray cmd run <name> [args]` in `home`. `kind:"text"` answers the
+/// markdown body; `kind:"ui"` — Slack v1 has no components — answers the
+/// `fallback_text` render; `kind:"prompt"` hands back the turn text;
+/// `!ok` surfaces the wire's error message.
+pub async fn run(
+    gray_bin: &Path,
+    home: &Path,
+    name: &str,
+    args: &str,
+    slow: bool,
+) -> Result<Outcome, String> {
     ensure_home(home)?;
     let mut argv = vec!["run", name];
     if !args.is_empty() {
         argv.push(args);
     }
-    let out = cmd_output(gray_bin, home, &argv).await?;
+    let timeout = if slow { SLOW_TIMEOUT } else { CMD_TIMEOUT };
+    let out = cmd_output(gray_bin, home, &argv, timeout).await?;
     if let Ok(reply) = serde_json::from_slice::<Value>(&out.stdout) {
         return result_text(&reply);
     }
@@ -198,8 +237,8 @@ pub async fn run(gray_bin: &Path, home: &Path, name: &str, args: &str) -> Result
     })
 }
 
-/// Wire reply -> postable text (stdout carries one JSON object).
-fn result_text(reply: &Value) -> Result<String, String> {
+/// Wire reply -> what to do with it (stdout carries one JSON object).
+fn result_text(reply: &Value) -> Result<Outcome, String> {
     if reply.get("ok").and_then(Value::as_bool) != Some(true) {
         let message = reply
             .pointer("/error/message")
@@ -209,17 +248,33 @@ fn result_text(reply: &Value) -> Result<String, String> {
         return Err(message.to_string());
     }
     let result = reply.get("result").unwrap_or(&Value::Null);
+    if result.get("kind").and_then(Value::as_str) == Some("prompt") {
+        let prompt = result
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if prompt.trim().is_empty() {
+            return Err("gray cmd answered an empty prompt".to_string());
+        }
+        let fallback = result
+            .get("fallback_text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return Ok(Outcome::Prompt { prompt, fallback });
+    }
     let field = match result.get("kind").and_then(Value::as_str) {
         Some("text") => "text",
         Some("ui") => "fallback_text",
         _ => return Err("unreadable gray cmd result".to_string()),
     };
     let text = result.get(field).and_then(Value::as_str).unwrap_or("");
-    Ok(if text.trim().is_empty() {
+    Ok(Outcome::Text(if text.trim().is_empty() {
         "Done.".to_string()
     } else {
         text.to_string()
-    })
+    }))
 }
 
 /// One `gray cmd` child with the runner's env discipline: cleared
@@ -229,6 +284,7 @@ async fn cmd_output(
     gray_bin: &Path,
     home: &Path,
     args: &[&str],
+    timeout: Duration,
 ) -> Result<std::process::Output, String> {
     let mut cmd = tokio::process::Command::new(gray_bin);
     cmd.arg("cmd");
@@ -257,7 +313,7 @@ async fn cmd_output(
             gray_bin,
         ),
     );
-    match tokio::time::timeout(CMD_TIMEOUT, cmd.output()).await {
+    match tokio::time::timeout(timeout, cmd.output()).await {
         Ok(Ok(out)) => Ok(out),
         Ok(Err(_)) => Err("cannot start gray agent".to_string()),
         Err(_) => Err("gray cmd timed out".to_string()),
@@ -326,9 +382,13 @@ mod tests {
     #[test]
     fn dispatch_verifies_against_the_registry() {
         let names = static_names();
+        let model = Cmd {
+            scope: Scope::Conversation,
+            slow: false,
+        };
         assert_eq!(
             dispatch("!model x", "UBOT", &names),
-            Some(("model".to_string(), "x".to_string(), Scope::Conversation))
+            Some(("model".to_string(), "x".to_string(), model))
         );
         // `!nope` parses but is nobody's command: it stays a prompt.
         assert_eq!(dispatch("!nope", "UBOT", &names), None);
@@ -346,10 +406,18 @@ mod tests {
             ]}
         });
         let names = parse_list(&reply).unwrap();
-        assert_eq!(names.get("model"), Some(&Scope::Conversation));
-        assert_eq!(names.get("m"), Some(&Scope::Conversation));
-        assert_eq!(names.get("gateway"), Some(&Scope::Global));
-        assert_eq!(names.get("theme"), Some(&Scope::Global));
+        let conv = Cmd {
+            scope: Scope::Conversation,
+            slow: false,
+        };
+        let glob = Cmd {
+            scope: Scope::Global,
+            slow: false,
+        };
+        assert_eq!(names.get("model"), Some(&conv));
+        assert_eq!(names.get("m"), Some(&conv));
+        assert_eq!(names.get("gateway"), Some(&glob));
+        assert_eq!(names.get("theme"), Some(&glob));
         assert!(parse_list(&json!({"ok": false})).is_none());
         assert!(parse_list(&json!({"ok": true, "result": {"commands": []}})).is_none());
     }
@@ -365,16 +433,22 @@ mod tests {
                 "fallback_text": "Pick a model:\n1. anthropic/claude-sonnet-4.6\nReply `!model <id>` to choose."
             }
         });
-        assert_eq!(
-            result_text(&reply).unwrap(),
-            "Pick a model:\n1. anthropic/claude-sonnet-4.6\nReply `!model <id>` to choose."
-        );
+        match result_text(&reply).unwrap() {
+            Outcome::Text(text) => assert_eq!(
+                text,
+                "Pick a model:\n1. anthropic/claude-sonnet-4.6\nReply `!model <id>` to choose."
+            ),
+            other => panic!("expected text: {other:?}"),
+        }
     }
 
     #[test]
     fn text_results_and_errors() {
         let text = json!({"ok": true, "result": {"kind": "text", "text": "**hi**"}});
-        assert_eq!(result_text(&text).unwrap(), "**hi**");
+        match result_text(&text).unwrap() {
+            Outcome::Text(t) => assert_eq!(t, "**hi**"),
+            other => panic!("expected text: {other:?}"),
+        }
         let err = json!({
             "ok": false,
             "error": {"code": "local_only", "message": "`theme` is TUI-only", "retryable": false}
