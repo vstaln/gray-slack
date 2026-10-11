@@ -51,7 +51,7 @@ struct Daemon {
 const BUSY_BACKOFF_SECS: f64 = 3.0;
 const QUEUED_ACK_SECS: f64 = 30.0;
 const STEER_HELP: &str =
-    "`/steer TEXT` (or `!steer TEXT`) — add guidance to the running turn; when idle it is sent as a new message";
+    "`/steer TEXT` (or `!steer TEXT`) — add guidance to the running turn; when idle it is sent as a new message\n`/stop` (or `!stop`) — cancel the running turn; queued messages still run";
 
 impl Daemon {
     fn home_channel(&self) -> &str {
@@ -295,6 +295,14 @@ impl Daemon {
             let _ = self.rest.post_text(channel, &reply, Some(ts)).await;
             return true;
         }
+        if name == "stop" {
+            let reply = match self.store.cancel_conversation(&conversation) {
+                Ok(true) => "Stopped.",
+                _ => "Nothing running.",
+            };
+            let _ = self.rest.post_text(channel, reply, Some(ts)).await;
+            return true;
+        }
         if name == "page" {
             let pages: Vec<String> = self
                 .store
@@ -430,14 +438,21 @@ impl Daemon {
         } else {
             Some(item.thread_ts.as_str())
         };
-        let outcome = crate::runner::run_gray(
-            &self.config,
-            &self.config_path,
-            &item.conversation,
-            &item.text,
-            None,
+        let outcome = crate::runner::cancellable(
+            crate::runner::run_gray(
+                &self.config,
+                &self.config_path,
+                &item.conversation,
+                &item.text,
+                None,
+            ),
+            || self.store.cancel_requested(&item.id).unwrap_or(false),
         )
         .await;
+        let Some(outcome) = outcome else {
+            self.store.mark_cancelled(&item.id)?;
+            return Ok(true);
+        };
         match outcome {
             Ok(answer) => {
                 let posted = self.rest.post_text(&item.channel, &answer, thread).await;

@@ -68,6 +68,18 @@ impl Drop for ConversationLock {
     }
 }
 
+struct ProcessGroup(libc::pid_t);
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 type SharedStdin = std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>;
 
 fn live_stdins() -> &'static std::sync::Mutex<std::collections::HashMap<String, SharedStdin>> {
@@ -379,6 +391,7 @@ pub async fn run_gray(
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
+    let mut group = ProcessGroup(pid as libc::pid_t);
 
     let stdout = child
         .stdout
@@ -402,13 +415,13 @@ pub async fn run_gray(
                     }
                 }
                 let _ = child.wait().await;
+                group.0 = 0;
                 return Err(RunError::Timeout);
             }
         };
-    let status = child
-        .wait()
-        .await
-        .map_err(|_| RunError::Spawn("wait failed".to_string()))?;
+    let status = child.wait().await;
+    group.0 = 0;
+    let status = status.map_err(|_| RunError::Spawn("wait failed".to_string()))?;
     let consumed = outcome?;
 
     // gray reports its request cap as a generic error row; the accounting
@@ -544,4 +557,22 @@ fn session_id_valid(s: &str) -> bool {
         && s.len() <= 64
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+pub async fn cancellable<F: std::future::Future>(
+    fut: F,
+    cancelled: impl Fn() -> bool,
+) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            _ = tick.tick() => {
+                if cancelled() {
+                    return None;
+                }
+            }
+        }
+    }
 }

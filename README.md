@@ -77,6 +77,8 @@ The service probes what this box actually supervises with (runit,
 - `/new` or `/reset` in a chat starts a fresh session.
 - `/steer TEXT` (or `!steer TEXT`) adds guidance to the running turn; when
   nothing runs it is sent as a new message.
+- `/stop` (or `!stop`) cancels the running turn ("Stopped."); queued
+  messages still run next. With nothing running it answers "Nothing running."
 - A message sent while a turn runs queues as its own next turn ("Queued — N
   ahead.", at most once per 30s per conversation); `"busy_input_mode":
   "steer"` in the config steers the running turn instead.
@@ -99,8 +101,8 @@ The service probes what this box actually supervises with (runit,
   ends).
 - Inbound file attachments appear as `[attached file: name]` markers;
   contents are not fetched.
-- Slash commands are not registered; `/new`, `/reset`, `/steer` and `/page`
-  are plain text (Slack's client may refuse an unknown `/name`; `!name` always
+- Slash commands are not registered; `/new`, `/reset`, `/steer`, `/stop` and
+  `/page` are plain text (Slack's client may refuse an unknown `/name`; `!name` always
   works).
 - Channel joins/leaves and edits/deletes are ignored.
 - Delivery is at-least-once; a crash between a Slack accept and the local
