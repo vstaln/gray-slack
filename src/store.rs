@@ -95,6 +95,7 @@ impl Store {
     /// Accept one inbound message. `ext_id` is Slack's channel+ts key;
     /// a socket-mode redelivery inserts nothing and returns `None`.
     /// `Err` when the queue is at capacity.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
         ext_id: &str,
@@ -135,16 +136,28 @@ impl Store {
         Ok((n > 0).then_some(id))
     }
 
-    /// Oldest queued item, atomically marked `running`.
     pub fn claim(&self) -> Result<Option<Item>, String> {
+        self.claim_except(&[])
+    }
+
+    pub fn claim_except(&self, skip: &[String]) -> Result<Option<Item>, String> {
         let conn = self.conn.lock().map_err(|_| "store locked".to_string())?;
-        let row = conn
-            .query_row(
-                "SELECT id,channel,thread_ts,sender,conversation,text,state \
-                 FROM inbox WHERE state='queued' ORDER BY created LIMIT 1",
-                [],
-                row_to_item,
+        let skip_sql = if skip.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND q.conversation NOT IN ({})",
+                vec!["?"; skip.len()].join(",")
             )
+        };
+        let sql = format!(
+            "SELECT id,channel,thread_ts,sender,conversation,text,state \
+             FROM inbox q WHERE state='queued'{skip_sql} AND NOT EXISTS \
+             (SELECT 1 FROM inbox r WHERE r.conversation=q.conversation AND r.state='running') \
+             ORDER BY created,id LIMIT 1"
+        );
+        let row = conn
+            .query_row(&sql, rusqlite::params_from_iter(skip.iter()), row_to_item)
             .ok();
         match row {
             Some(item) => {
@@ -160,6 +173,20 @@ impl Store {
             }
             None => Ok(None),
         }
+    }
+
+    pub fn ahead_in_conversation(&self, conversation: &str, id: &str) -> Result<i64, String> {
+        self.conn
+            .lock()
+            .map_err(|_| "store locked".to_string())?
+            .query_row(
+                "SELECT count(*) FROM inbox r WHERE r.conversation=?1 AND r.id<>?2 \
+                 AND (r.state='running' OR (r.state='queued' AND (r.created,r.id) < \
+                 (SELECT created,id FROM inbox WHERE id=?2)))",
+                rusqlite::params![conversation, id],
+                |r| r.get(0),
+            )
+            .map_err(map_err)
     }
 
     /// Put a claimed item back (a Busy conversation holds its lock).

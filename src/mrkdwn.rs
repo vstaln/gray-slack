@@ -207,7 +207,6 @@ pub fn convert(markdown: &str) -> String {
     flush_table(&mut out, &mut table);
     // Trailing newline the loop always adds: trim to the input's own
     // trailing-newline presence.
-    let mut out = out;
     if !markdown.ends_with('\n') {
         while out.ends_with('\n') {
             out.pop();

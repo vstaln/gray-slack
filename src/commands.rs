@@ -58,9 +58,7 @@ pub fn parse_prefixed(text: &str, bot_user_id: &str) -> Option<(String, String)>
     }
     let rest = rest.strip_prefix('!').or_else(|| rest.strip_prefix('/'))?;
     let name_len = rest
-        .find(|c: char| {
-            !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-        })
+        .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'))
         .unwrap_or(rest.len());
     let (name, args) = rest.split_at(name_len);
     if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_lowercase()) {
@@ -109,6 +107,12 @@ pub struct Cache(Mutex<Option<Cached>>);
 struct Cached {
     names: HashMap<String, Cmd>,
     fetched: Instant,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Cache {
@@ -172,7 +176,9 @@ fn parse_list(reply: &Value) -> Option<HashMap<String, Cmd>> {
     if reply.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    let commands = reply.pointer("/result/commands").and_then(Value::as_array)?;
+    let commands = reply
+        .pointer("/result/commands")
+        .and_then(Value::as_array)?;
     let mut names = HashMap::new();
     for command in commands {
         let row = Cmd {
@@ -180,7 +186,10 @@ fn parse_list(reply: &Value) -> Option<HashMap<String, Cmd>> {
                 Some("global") => Scope::Global,
                 _ => Scope::Conversation,
             },
-            slow: command.get("slow").and_then(Value::as_bool).unwrap_or(false),
+            slow: command
+                .get("slow")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
         if let Some(name) = command.get("name").and_then(Value::as_str) {
             names.insert(name.to_string(), row);
@@ -341,7 +350,10 @@ mod tests {
     fn parses_bang_and_slash() {
         assert_eq!(
             parse_prefixed("!model anthropic/claude-sonnet-4.6", "UBOT"),
-            Some(("model".to_string(), "anthropic/claude-sonnet-4.6".to_string()))
+            Some((
+                "model".to_string(),
+                "anthropic/claude-sonnet-4.6".to_string()
+            ))
         );
         assert_eq!(
             parse_prefixed("/help", "UBOT"),

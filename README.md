@@ -75,6 +75,13 @@ The service probes what this box actually supervises with (runit,
 - DM the bot, or post in an allowed channel / the home channel.
 - Replies land in the message's thread (`reply_in_thread`, default on).
 - `/new` or `/reset` in a chat starts a fresh session.
+- `/steer TEXT` (or `!steer TEXT`) adds guidance to the running turn; when
+  nothing runs it is sent as a new message.
+- A message sent while a turn runs queues as its own next turn ("Queued — N
+  ahead.", at most once per 30s per conversation); `"busy_input_mode":
+  "steer"` in the config steers the running turn instead.
+- Long command output posts page 1 with a `page 1/N — /page 2` footer;
+  `/page N` (or `!page N`) shows another page.
 - A human who DMs an unconfigured allowlist gets a one-shot pairing code;
   the owner approves it with `gray slack pairing approve slack <CODE>`.
 
@@ -92,7 +99,9 @@ The service probes what this box actually supervises with (runit,
   ends).
 - Inbound file attachments appear as `[attached file: name]` markers;
   contents are not fetched.
-- Slash commands are not registered; `/new` and `/reset` are plain text.
+- Slash commands are not registered; `/new`, `/reset`, `/steer` and `/page`
+  are plain text (Slack's client may refuse an unknown `/name`; `!name` always
+  works).
 - Channel joins/leaves and edits/deletes are ignored.
 - Delivery is at-least-once; a crash between a Slack accept and the local
   record can duplicate a reply chunk (see docs/RUNTIME.md).

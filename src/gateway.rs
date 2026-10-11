@@ -44,7 +44,14 @@ struct Daemon {
     rest: Rest,
     bot_user_id: String,
     commands: crate::commands::Cache,
+    busy_backoff: std::sync::Mutex<std::collections::HashMap<String, f64>>,
+    queued_acks: std::sync::Mutex<std::collections::HashMap<String, f64>>,
 }
+
+const BUSY_BACKOFF_SECS: f64 = 3.0;
+const QUEUED_ACK_SECS: f64 = 30.0;
+const STEER_HELP: &str =
+    "`/steer TEXT` (or `!steer TEXT`) — add guidance to the running turn; when idle it is sent as a new message";
 
 impl Daemon {
     fn home_channel(&self) -> &str {
@@ -56,6 +63,68 @@ impl Daemon {
             .get("reply_in_thread")
             .and_then(Value::as_bool)
             .unwrap_or(true)
+    }
+
+    fn deliver_thread(&self, ts: &str, thread_root: &str) -> String {
+        if !self.reply_in_thread() {
+            String::new()
+        } else if thread_root.is_empty() {
+            ts.to_string()
+        } else {
+            thread_root.to_string()
+        }
+    }
+
+    fn capacity(&self) -> u64 {
+        self.config
+            .get("queue_capacity")
+            .and_then(Value::as_u64)
+            .unwrap_or(1000)
+    }
+
+    fn queued_notice(&self, conversation: &str, id: &str) -> Option<String> {
+        let ahead = self.store.ahead_in_conversation(conversation, id).ok()?;
+        if ahead <= 0 {
+            return None;
+        }
+        let now = crate::store::now_secs();
+        let mut acks = self.queued_acks.lock().unwrap_or_else(|e| e.into_inner());
+        if acks
+            .get(conversation)
+            .is_some_and(|at| now - at < QUEUED_ACK_SECS)
+        {
+            return None;
+        }
+        acks.retain(|_, at| now - *at < QUEUED_ACK_SECS);
+        acks.insert(conversation.to_string(), now);
+        Some(format!("Queued — {ahead} ahead."))
+    }
+
+    async fn post_paged(&self, channel: &str, ts: &str, conversation: &str, text: &str) {
+        let pages = crate::mrkdwn::chunk(&crate::mrkdwn::convert(text));
+        if pages.len() <= 1 {
+            let _ = self.rest.post_text(channel, text, Some(ts)).await;
+            return;
+        }
+        let key = format!("pages:{conversation}");
+        let _ = self
+            .store
+            .meta_set(&key, &serde_json::to_string(&pages).unwrap_or_default());
+        self.post_page(channel, ts, &pages, 1).await;
+    }
+
+    async fn post_page(&self, channel: &str, ts: &str, pages: &[String], n: usize) {
+        let total = pages.len();
+        let page = &pages[n - 1];
+        let footer = if n < total {
+            format!("_page {n}/{total} — /page {}_", n + 1)
+        } else {
+            format!("_page {n}/{total}_")
+        };
+        let _ = self
+            .rest
+            .post_message(channel, &format!("{page}\n\n{footer}"), Some(ts))
+            .await;
     }
 
     fn user_admitted(&self, user: &str) -> bool {
@@ -147,22 +216,17 @@ impl Daemon {
         }
 
         let conversation = crate::session::conversation_key(channel, &thread_root, user, is_dm);
-        let capacity = self
-            .config
-            .get("queue_capacity")
-            .and_then(Value::as_u64)
-            .unwrap_or(1000);
-        // The reply target: the inbound thread, or the message itself when
-        // replies should open a thread.
-        let deliver_thread = if self.reply_in_thread() {
-            if thread_root.is_empty() {
-                ts.to_string()
-            } else {
-                thread_root.clone()
-            }
-        } else {
-            String::new()
-        };
+        let capacity = self.capacity();
+        if self.config.get("busy_input_mode").and_then(Value::as_str) == Some("steer")
+            && crate::runner::steer(&conversation, &text).await
+        {
+            let _ = self
+                .rest
+                .post_text(channel, "Steering the current turn.", Some(ts))
+                .await;
+            return;
+        }
+        let deliver_thread = self.deliver_thread(ts, &thread_root);
         match self.store.enqueue(
             &format!("{channel}:{ts}"),
             channel,
@@ -172,7 +236,12 @@ impl Daemon {
             &text,
             capacity,
         ) {
-            Ok(Some(id)) => eprintln!("[slack] queued {id}"),
+            Ok(Some(id)) => {
+                eprintln!("[slack] queued {id}");
+                if let Some(notice) = self.queued_notice(&conversation, &id) {
+                    let _ = self.rest.post_text(channel, &notice, Some(ts)).await;
+                }
+            }
             Ok(None) => {} // socket-mode redelivery; already accepted
             Err(e) => {
                 let _ = self
@@ -199,12 +268,62 @@ impl Daemon {
         is_dm: bool,
         thread_ts: &str,
     ) -> bool {
-        let Some((name, args)) = crate::commands::parse_prefixed(text, &self.bot_user_id)
-        else {
+        let Some((name, args)) = crate::commands::parse_prefixed(text, &self.bot_user_id) else {
             return false;
         };
         let conversation = crate::session::conversation_key(channel, thread_ts, user, is_dm);
         let home = crate::session::conversation_home(&self.config_path, &conversation);
+        if name == "steer" {
+            let reply = if args.trim().is_empty() {
+                "Usage: /steer TEXT".to_string()
+            } else if crate::runner::steer(&conversation, &args).await {
+                "Steering the current turn.".to_string()
+            } else {
+                match self.store.enqueue(
+                    &format!("{channel}:{ts}"),
+                    channel,
+                    &self.deliver_thread(ts, thread_ts),
+                    user,
+                    &conversation,
+                    &args,
+                    self.capacity(),
+                ) {
+                    Ok(_) => "Nothing running — sent as a new message.".to_string(),
+                    Err(e) => format!("Queue full ({e}); try again later."),
+                }
+            };
+            let _ = self.rest.post_text(channel, &reply, Some(ts)).await;
+            return true;
+        }
+        if name == "page" {
+            let pages: Vec<String> = self
+                .store
+                .meta_get(&format!("pages:{conversation}"))
+                .ok()
+                .flatten()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            match args.trim().parse::<usize>() {
+                Ok(n) if n >= 1 && n <= pages.len() => self.post_page(channel, ts, &pages, n).await,
+                _ if pages.is_empty() => {
+                    let _ = self
+                        .rest
+                        .post_text(channel, "Nothing to page.", Some(ts))
+                        .await;
+                }
+                _ => {
+                    let _ = self
+                        .rest
+                        .post_text(
+                            channel,
+                            &format!("Pick a page from 1 to {}.", pages.len()),
+                            Some(ts),
+                        )
+                        .await;
+                }
+            }
+            return true;
+        }
         // `/new` and `/reset` already reset the private home locally; the
         // `!` twins take the same path rather than `gray cmd run new`.
         if matches!(name.as_str(), "new" | "reset") {
@@ -245,7 +364,12 @@ impl Daemon {
         );
         match crate::commands::run(Path::new(gray_bin), &cmd_home, &name, &args, cmd.slow).await {
             Ok(crate::commands::Outcome::Text(text)) => {
-                let _ = self.rest.post_text(channel, &text, Some(ts)).await;
+                let text = if name == "help" && !text.contains("/steer") {
+                    format!("{text}\n\n{STEER_HELP}")
+                } else {
+                    text
+                };
+                self.post_paged(channel, ts, &conversation, &text).await;
             }
             Ok(crate::commands::Outcome::Prompt { prompt, fallback }) => {
                 let capacity = self
@@ -292,7 +416,13 @@ impl Daemon {
 
     /// One claimed inbox item end to end.
     async fn work(&self) -> Result<bool, String> {
-        let Some(item) = self.store.claim()? else {
+        let skip: Vec<String> = {
+            let now = crate::store::now_secs();
+            let mut backoff = self.busy_backoff.lock().unwrap_or_else(|e| e.into_inner());
+            backoff.retain(|_, until| *until > now);
+            backoff.keys().cloned().collect()
+        };
+        let Some(item) = self.store.claim_except(&skip)? else {
             return Ok(false);
         };
         let thread = if item.thread_ts.is_empty() {
@@ -322,7 +452,13 @@ impl Daemon {
             }
             Err(RunError::Busy) => {
                 self.store.requeue(&item.id)?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.busy_backoff
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        item.conversation.clone(),
+                        crate::store::now_secs() + BUSY_BACKOFF_SECS,
+                    );
             }
             Err(e) => {
                 let _ = self
@@ -363,6 +499,8 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         rest,
         bot_user_id: auth.user_id.clone(),
         commands: crate::commands::Cache::new(),
+        busy_backoff: Default::default(),
+        queued_acks: Default::default(),
     });
 
     // Startup notice (gray core words it when it can).
