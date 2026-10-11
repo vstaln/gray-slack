@@ -201,6 +201,29 @@ impl Rest {
             return Ok(0);
         }
         let mut sent = 0;
+        if chunks.len() > 8 {
+            self.post_message(channel, &chunks[0], thread_ts).await?;
+            sent += 1;
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let path =
+                std::env::temp_dir().join(format!("gray-slack-{}-{nonce}.txt", std::process::id()));
+            if std::fs::write(&path, text).is_ok() {
+                let _ = self
+                    .upload_file(
+                        channel,
+                        &path,
+                        Some("full reply"),
+                        Some("Reply too long — full text attached."),
+                        thread_ts,
+                    )
+                    .await;
+                let _ = std::fs::remove_file(&path);
+            }
+            return Ok(sent);
+        }
         for part in &chunks {
             self.post_message(channel, part, thread_ts).await?;
             sent += 1;
