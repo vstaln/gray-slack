@@ -43,6 +43,7 @@ struct Daemon {
     store: Store,
     rest: Rest,
     bot_user_id: String,
+    commands: crate::commands::Cache,
 }
 
 impl Daemon {
@@ -186,8 +187,9 @@ impl Daemon {
         }
     }
 
-    /// `/new` and `/reset` start a fresh session in this conversation.
-    /// Returns true when the text was a command.
+    /// `!name args` / `/name args` run the headless `gray cmd` surface;
+    /// `/new` and `/reset` keep their local reset. Returns true when the
+    /// text was a command — commands answer here, never a queued turn.
     async fn command(
         &self,
         channel: &str,
@@ -197,29 +199,52 @@ impl Daemon {
         is_dm: bool,
         thread_ts: &str,
     ) -> bool {
-        if !matches!(text.trim(), "/new" | "/reset") {
+        let Some((name, args)) = crate::commands::parse_prefixed(text, &self.bot_user_id)
+        else {
             return false;
-        }
+        };
         let conversation = crate::session::conversation_key(channel, thread_ts, user, is_dm);
         let home = crate::session::conversation_home(&self.config_path, &conversation);
-        match crate::session::reset_home(&home, crate::store::now_secs()) {
-            Ok(()) => {
-                let _ = self
-                    .rest
-                    .post_text(
-                        channel,
-                        "Session reset — the next message starts fresh.",
-                        Some(ts),
-                    )
-                    .await;
+        // `/new` and `/reset` already reset the private home locally; the
+        // `!` twins take the same path rather than `gray cmd run new`.
+        if matches!(name.as_str(), "new" | "reset") {
+            match crate::session::reset_home(&home, crate::store::now_secs()) {
+                Ok(()) => {
+                    let _ = self
+                        .rest
+                        .post_text(
+                            channel,
+                            "Session reset — the next message starts fresh.",
+                            Some(ts),
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    let _ = self
+                        .rest
+                        .post_text(channel, "Could not reset this session.", Some(ts))
+                        .await;
+                }
             }
-            Err(_) => {
-                let _ = self
-                    .rest
-                    .post_text(channel, "Could not reset this session.", Some(ts))
-                    .await;
-            }
+            return true;
         }
+        let gray_bin = cfg_str(&self.config, "gray_bin");
+        if gray_bin.is_empty() {
+            return false;
+        }
+        let names = self.commands.names(Path::new(gray_bin), &home).await;
+        // Unknown name: leave the text for the normal turn.
+        let Some(&scope) = names.get(name.as_str()) else {
+            return false;
+        };
+        let cmd_home =
+            crate::commands::command_home(&self.config, &self.config_path, &conversation, scope);
+        let posted =
+            match crate::commands::run(Path::new(gray_bin), &cmd_home, &name, &args).await {
+                Ok(text) => text,
+                Err(message) => format!("_{message}_"),
+            };
+        let _ = self.rest.post_text(channel, &posted, Some(ts)).await;
         true
     }
 
@@ -295,6 +320,7 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
         store,
         rest,
         bot_user_id: auth.user_id.clone(),
+        commands: crate::commands::Cache::new(),
     });
 
     // Startup notice (gray core words it when it can).

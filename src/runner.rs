@@ -75,7 +75,7 @@ fn shell_word(value: &str) -> String {
 
 /// gray's PATH inside the child: the real PATH plus the gray binary's dir
 /// and the usual user locations, so a launchd/systemd PATH still finds it.
-fn child_path(
+pub(crate) fn child_path(
     current: Option<std::ffi::OsString>,
     home: Option<PathBuf>,
     gray_bin: &Path,
