@@ -297,7 +297,7 @@ impl Daemon {
         }
         if name == "stop" {
             let reply = match self.store.cancel_conversation(&conversation) {
-                Ok(true) => "Stopped.",
+                Ok(true) => "Stopped. Some steps may already have run.",
                 _ => "Nothing running.",
             };
             let _ = self.rest.post_text(channel, reply, Some(ts)).await;
@@ -478,7 +478,11 @@ impl Daemon {
             Err(e) => {
                 let _ = self
                     .rest
-                    .post_text(&item.channel, &format!("_{e}_"), thread)
+                    .post_text(
+                        &item.channel,
+                        &format!("_{}_", crate::runner::failure_notice(&e)),
+                        thread,
+                    )
                     .await;
                 self.store.fail(&item.id, &e.to_string())?;
             }
