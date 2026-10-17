@@ -10,6 +10,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "name": "slack",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
+        "requires_plugins": ["gateway"],
         "commands": [],
         "hooks": ["prompt/context"],
         "tools": [{
