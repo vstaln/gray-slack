@@ -568,14 +568,22 @@ pub async fn run(config_path: &Path) -> Result<(), String> {
     {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
-            let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                .expect("SIGINT handler");
-            tokio::select! {
-                _ = term.recv() => {},
-                _ = int.recv() => {},
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("SIGTERM handler");
+                let mut int =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                        .expect("SIGINT handler");
+                tokio::select! {
+                    _ = term.recv() => {},
+                    _ = int.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
             }
             shutdown.notify_waiters();
         });

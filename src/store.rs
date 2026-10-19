@@ -40,17 +40,36 @@ pub fn now_secs() -> f64 {
         .unwrap_or_default()
 }
 
+
+/// Fill `buf` from `/dev/urandom` where it exists; elsewhere mix pid +
+/// time + RandomState so ids and pairing codes still differ.
+pub(crate) fn fill_entropy(buf: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if std::fs::File::open("/dev/urandom")
+            .map(|mut f| f.read_exact(buf).is_ok())
+            .unwrap_or(false)
+        {
+            return;
+        }
+    }
+    use std::hash::{BuildHasher, Hasher};
+    for (i, chunk) in buf.chunks_mut(8).enumerate() {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.write_usize(i);
+        if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            h.write_u128(d.as_nanos());
+        }
+        let bytes = h.finish().to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+}
+
 pub fn uuid_hex() -> String {
     let mut bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = f.read_exact(&mut bytes);
-    } else {
-        // Fallback: time + pid entropy — ids only need uniqueness.
-        let nanos = now_secs().to_bits();
-        bytes[..8].copy_from_slice(&nanos.to_le_bytes());
-        bytes[8..12].copy_from_slice(&std::process::id().to_le_bytes());
-    }
+    fill_entropy(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

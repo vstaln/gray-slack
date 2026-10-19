@@ -2,7 +2,6 @@
 //! One conversation home per sha256(conversation); explicit session pointers
 //! only — never guess a shared session id.
 use serde_json::Value;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Cap on one NDJSON stdout line (matches gray's own wire limit).
@@ -84,27 +83,82 @@ struct Consume {
 /// Held while a turn runs on a conversation home.
 struct ConversationLock {
     _file: std::fs::File,
-    fd: i32,
 }
 
 impl Drop for ConversationLock {
     fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.fd, libc::LOCK_UN);
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 }
 
-struct ProcessGroup(libc::pid_t);
+struct ProcessGroup(u32);
 
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if self.0 > 0 {
-            unsafe {
-                libc::kill(-self.0, libc::SIGKILL);
-            }
+            kill_process_tree(self.0);
         }
     }
+}
+
+/// Exclusive lock on `path`: `Some(file)` while another process has not
+/// already locked it. Unix takes `flock` on an FD_CLOEXEC descriptor;
+/// Windows opens with `share_mode(0)`, which closes the lock with the file.
+#[cfg(unix)]
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::create(path)?;
+    let fd = f.as_raw_fd();
+    // Do not let another concurrently spawned gray child inherit this lock
+    // descriptor.
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd_flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let locked = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    Ok(locked.then_some(f))
+}
+
+#[cfg(windows)]
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
+        // ERROR_SHARING_VIOLATION: another process holds the lock.
+        Err(e) if e.raw_os_error() == Some(32) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Kill the process tree rooted at `pid`: the child's process group on unix
+/// (it leads its own group, see `pre_exec`), `taskkill /T` on Windows.
+#[cfg(unix)]
+pub(crate) fn kill_process_tree(pid: u32) {
+    // SAFETY: kill only signals.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn kill_process_tree(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", pid.to_string().as_str(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 type SharedStdin = std::sync::Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>;
@@ -172,6 +226,7 @@ pub async fn steer(conversation: &str, text: &str) -> bool {
 }
 
 /// Single-quote shell escaping for launcher argv words.
+#[cfg(unix)]
 fn shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -232,35 +287,29 @@ pub async fn run_gray(
     }
 
     let home = crate::session::conversation_home(config_path, conversation);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(&home)
         .map_err(|_| RunError::Io("cannot create conversation home".to_string()))?;
-    let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    }
 
     // Non-blocking per-conversation lock, held for the whole turn.
-    let lock_file = std::fs::File::create(home.join("run.lock"))
-        .map_err(|_| RunError::Io("cannot lock conversation".to_string()))?;
-    use std::os::unix::io::AsRawFd;
-    let lock_fd = lock_file.as_raw_fd();
-    // Do not let another concurrently spawned gray child inherit this lock
-    // descriptor. Otherwise a child for conversation B can keep conversation
-    // A's flock alive after A's runner future has returned.
-    let fd_flags = unsafe { libc::fcntl(lock_fd, libc::F_GETFD) };
-    if fd_flags < 0
-        || unsafe { libc::fcntl(lock_fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0
-    {
-        return Err(RunError::Io("cannot protect conversation lock".to_string()));
-    }
-    let locked = unsafe { libc::flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
-    if !locked {
+    let Some(lock_file) = open_lock_file(&home.join("run.lock"))
+        .map_err(|_| RunError::Io("cannot lock conversation".to_string()))?
+    else {
         return Err(RunError::Busy);
-    }
-    let _lock = ConversationLock {
-        _file: lock_file,
-        fd: lock_fd,
     };
+    let _lock = ConversationLock { _file: lock_file };
 
     // Snapshot the provider config into the isolated home.
     let gray_home = config
@@ -283,12 +332,24 @@ pub async fn run_gray(
     // Dedicated workdir/profile: the slack tools plus the minimal builtin
     // set — no lockfile plugins that might start another gateway.
     let work = home.join("work");
-    std::fs::DirBuilder::new()
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(&work)
         .or_else(|e| if work.is_dir() { Ok(()) } else { Err(e) })
         .map_err(|_| RunError::Io("cannot create work directory".to_string()))?;
-    let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(windows)]
+    let launcher = home.join("slack-sidecar.cmd");
+    #[cfg(unix)]
     let launcher = home.join("slack-sidecar");
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -297,15 +358,22 @@ pub async fn run_gray(
         .to_str()
         .map(str::to_string)
         .unwrap_or_else(|| config_path.to_string_lossy().into_owned());
+    #[cfg(unix)]
     let script = format!(
         "#!/bin/sh\nexec {} sidecar --config {}\n",
         shell_word(&exe),
         shell_word(&abs_config)
     );
+    #[cfg(windows)]
+    let script = format!("@echo off\r\n\"{}\" sidecar --config \"{}\"\r\n", exe, abs_config);
     std::fs::write(&launcher, script)
         .map_err(|_| RunError::Io("cannot write launcher".to_string()))?;
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
-        .map_err(|_| RunError::Io("cannot protect launcher".to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| RunError::Io("cannot protect launcher".to_string()))?;
+    }
     let profile = format!(
         "plugins:\n  - builtin: tools-minimal\n  - sidecar: {}\n",
         serde_json::to_string(&launcher.to_string_lossy()).unwrap_or_default()
@@ -390,12 +458,18 @@ pub async fn run_gray(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
     cmd.kill_on_drop(true);
-    // Own process group so a timeout SIGKILL reaches grandchildren too.
+    // Own process group so a timeout kill reaches grandchildren too.
+    #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
             Ok(())
         });
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     cmd.env_clear();
     for (k, v) in std::env::vars_os() {
@@ -428,7 +502,7 @@ pub async fn run_gray(
         .spawn()
         .map_err(|_| RunError::Spawn("spawn failed".to_string()))?;
     let pid = child.id().unwrap_or(0);
-    let mut group = ProcessGroup(pid as libc::pid_t);
+    let mut group = ProcessGroup(pid);
 
     let stdout = child
         .stdout
@@ -447,9 +521,7 @@ pub async fn run_gray(
             Err(_) => {
                 // Timeout: kill the whole process group.
                 if pid != 0 {
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                    }
+                    kill_process_tree(pid);
                 }
                 let _ = child.wait().await;
                 group.0 = 0;

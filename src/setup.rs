@@ -57,6 +57,7 @@ impl Prompter for Tty {
 /// Echo off for one read. Ctrl-C would otherwise kill setup with the
 /// terminal still silent, so SIGINT restores it first (tcsetattr is
 /// async-signal-safe).
+#[cfg(unix)]
 fn without_echo<T>(read: impl FnOnce() -> T) -> T {
     static SAVED: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
     extern "C" fn restore_and_exit(_: libc::c_int) {
@@ -85,13 +86,44 @@ fn without_echo<T>(read: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Echo off for one read via the console input mode. If setup is Ctrl-C'd
+/// mid-read the console stays silent, but cmd.exe restores its own mode at
+/// the next prompt.
+#[cfg(windows)]
+fn without_echo<T>(read: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return read();
+        }
+        let mut mode: u32 = 0;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return read();
+        }
+        let saved = mode;
+        SetConsoleMode(handle, saved & !ENABLE_ECHO_INPUT);
+        let out = read();
+        SetConsoleMode(handle, saved);
+        out
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn without_echo<T>(read: impl FnOnce() -> T) -> T {
+    read()
+}
+
 /// Resolve the gray binary (`GRAY_BIN` env or `PATH` lookup).
 fn resolve_gray(explicit: &str) -> Option<String> {
     let candidate = explicit.trim();
     if candidate.is_empty() {
         return None;
     }
-    if candidate.contains('/') {
+    if candidate.contains('/') || candidate.contains('\\') {
         let path = Path::new(candidate);
         if path.is_file() && is_executable(path) {
             return Some(candidate.to_string());
@@ -100,9 +132,14 @@ fn resolve_gray(explicit: &str) -> Option<String> {
     }
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
-        let full = dir.join(candidate);
-        if full.is_file() && is_executable(&full) {
-            return Some(full.to_string_lossy().into_owned());
+        let mut candidates = vec![dir.join(candidate)];
+        if cfg!(windows) && !candidate.ends_with(".exe") {
+            candidates.push(dir.join(format!("{candidate}.exe")));
+        }
+        for full in candidates {
+            if full.is_file() && is_executable(&full) {
+                return Some(full.to_string_lossy().into_owned());
+            }
         }
     }
     None

@@ -301,6 +301,15 @@ fn spawn_detached(argv: &[String], config_dir: &Path) -> Result<u32, String> {
             });
         }
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: the daemon outlives
+        // this console the way setsid detaches a unix child.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
     let child = command
         .spawn()
         .map_err(|e| format!("could not start {}: {e}", argv[0]))?;
@@ -327,8 +336,27 @@ fn pid_alive(pid: u32) -> bool {
         // SAFETY: kill(pid, 0) only probes.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0;
+            let queried = GetExitCodeProcess(handle, &mut code) != 0;
+            CloseHandle(handle);
+            // STILL_ACTIVE
+            queried && code == 259
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
         false
     }
 }
@@ -342,10 +370,29 @@ fn term_pid(pid: u32) -> Result<(), String> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if handle.is_null() {
+                return Err(format!("could not signal pid {pid}"));
+            }
+            let ok = TerminateProcess(handle, 0) != 0;
+            CloseHandle(handle);
+            if ok {
+                return Ok(());
+            }
+            return Err(format!("could not signal pid {pid}"));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
-        Err("stopping a gray-supervised daemon needs a unix host".to_string())
+        Err("stopping a gray-supervised daemon is unsupported on this platform".to_string())
     }
 }
 

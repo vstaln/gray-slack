@@ -331,13 +331,21 @@ async fn cmd_output(
 
 /// The conversation home exists before gray sees it, same as runner.rs.
 fn ensure_home(home: &Path) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
         .create(home)
         .map_err(|_| "cannot create conversation home".to_string())?;
-    let _ = std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700));
+    }
     Ok(())
 }
 
