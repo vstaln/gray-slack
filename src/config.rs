@@ -2,12 +2,12 @@
 //! Errors never contain config values.
 use serde_json::Value;
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Default config path: ~/.config/gray-slack/config.json.
 pub fn default_path() -> PathBuf {
     let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".config/gray-slack/config.json")
@@ -18,9 +18,14 @@ pub fn default_path() -> PathBuf {
 pub fn atomic_json(path: &Path, data: &Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
                 .create(parent)
                 .map_err(|_| "cannot create config directory".to_string())?;
         }
@@ -32,18 +37,23 @@ pub fn atomic_json(path: &Path, data: &Value) -> Result<(), String> {
     // Born 0600: the tokens are never readable by others, not even briefly.
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp_path)
             .and_then(|mut f| f.write_all(text.as_bytes()))
             .map_err(|_| "cannot write config".to_string())?;
     }
-    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-        .map_err(|_| "cannot protect config".to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| "cannot protect config".to_string())?;
+    }
     fs::rename(&tmp_path, path).map_err(|_| "cannot replace config".to_string())?;
     Ok(())
 }

@@ -12,13 +12,7 @@ use std::path::Path;
 pub fn gen_code() -> String {
     const ALPHABET: &[u8; 36] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut bytes = [0u8; 8];
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut bytes);
-        }
-    }
+    crate::store::fill_entropy(&mut bytes);
     bytes
         .iter()
         .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
