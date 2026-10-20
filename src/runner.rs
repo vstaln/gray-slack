@@ -351,8 +351,13 @@ pub async fn run_gray(
     let launcher = home.join("slack-sidecar.cmd");
     #[cfg(unix)]
     let launcher = home.join("slack-sidecar");
+    // A reinstall under the running service reads as "<path> (deleted)";
+    // the launcher must exec the replacement at <path>.
     let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| {
+            let p = p.to_string_lossy();
+            p.strip_suffix(" (deleted)").unwrap_or(&p).to_string()
+        })
         .unwrap_or_else(|_| "gray-slack".to_string());
     let abs_config = config_path
         .to_str()
@@ -365,7 +370,10 @@ pub async fn run_gray(
         shell_word(&abs_config)
     );
     #[cfg(windows)]
-    let script = format!("@echo off\r\n\"{}\" sidecar --config \"{}\"\r\n", exe, abs_config);
+    let script = format!(
+        "@echo off\r\n\"{}\" sidecar --config \"{}\"\r\n",
+        exe, abs_config
+    );
     std::fs::write(&launcher, script)
         .map_err(|_| RunError::Io("cannot write launcher".to_string()))?;
     #[cfg(unix)]

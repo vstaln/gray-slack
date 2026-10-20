@@ -374,7 +374,7 @@ fn term_pid(pid: u32) -> Result<(), String> {
     {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
         };
         unsafe {
             let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
