@@ -183,16 +183,61 @@ fn systemd_run(args: &[&str]) -> Result<String, String> {
             text.push_str(&String::from_utf8_lossy(&out.stderr));
             let text = text.trim().to_string();
             if !out.status.success() {
-                return Err(format!(
+                let mut msg = format!(
                     "systemctl {} failed: {}",
                     args.join(" "),
                     text.lines().last().unwrap_or("unknown error")
-                ));
+                );
+                if unit_not_loaded(&text) {
+                    msg.push_str(&format!(
+                        " — {NAME} isn't loaded; 'systemctl --user daemon-reload' \
+                         may pick it up, or 'gray {} install' recreates it",
+                        SVC.strip_prefix("gray-").unwrap_or(SVC)
+                    ));
+                }
+                return Err(msg);
             }
             Ok(text)
         }
         Err(e) => Err(format!("systemctl failed; check the user session: {e}")),
     }
+}
+
+/// Whether `systemctl --user` can see the unit right now. A unit file left
+/// on disk by a failed install reads NotFound until a daemon-reload picks
+/// it up — setup should offer a fresh install, not "restart".
+enum UnitLoad {
+    Loaded,
+    NotFound,
+    /// Can't ask (no systemctl, no user bus): let the lifecycle call
+    /// surface the real error instead of guessing either way.
+    Unknown,
+}
+
+fn unit_load_state() -> UnitLoad {
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", "show", NAME, "-p", "LoadState", "--value"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => match String::from_utf8_lossy(&o.stdout).trim() {
+            "not-found" => UnitLoad::NotFound,
+            _ => UnitLoad::Loaded,
+        },
+        Ok(o) if unit_not_loaded(&String::from_utf8_lossy(&o.stderr)) => UnitLoad::NotFound,
+        _ => UnitLoad::Unknown,
+    }
+}
+
+/// Does this systemctl output mean the manager can't see the unit (as
+/// opposed to the call or the unit itself being broken)?
+fn unit_not_loaded(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("could not be found")
+        || t.contains("does not exist")
+        || t.contains("not found")
+        || t.contains("not-found")
+        || t.contains("not loaded")
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +484,12 @@ pub fn uninstall(config_path: &Path) -> Result<String, String> {
 pub fn installed(config_path: &Path) -> bool {
     match detect() {
         Supervisor::Runit { dir } => dir.join(SVC).join("run").is_file(),
-        Supervisor::SystemdUser { unit_dir } => unit_dir.join(NAME).exists(),
+        Supervisor::SystemdUser { unit_dir } => {
+            // A unit file systemd never loaded (aborted install, stale
+            // leftover) isn't an installed service — setup should ask to
+            // install again, not "restart" a unit that doesn't exist.
+            unit_dir.join(NAME).exists() && !matches!(unit_load_state(), UnitLoad::NotFound)
+        }
         Supervisor::None => running_pid(&config_dir_of(config_path)).is_some(),
     }
 }
@@ -489,7 +539,10 @@ pub fn install_with(sup: Supervisor, config_path: &Path) -> Result<String, Strin
             if target.exists() {
                 let existing =
                     std::fs::read_to_string(&target).map_err(|_| "cannot read unit".to_string())?;
-                if existing != body {
+                // A unit file the manager can't see guards nothing — a stale
+                // install can always be rewritten. A *loaded* but different
+                // unit still refuses until it is uninstalled.
+                if existing != body && !matches!(unit_load_state(), UnitLoad::NotFound) {
                     return Err(
                         "A different plugin service already exists; uninstall it first".to_string(),
                     );
@@ -649,9 +702,16 @@ pub fn uninstall_with(sup: Supervisor, config_path: &Path) -> Result<String, Str
             if !target.exists() {
                 return Ok(format!("no unit at {} to remove", target.display()));
             }
-            systemd_run(&["disable", "--now", NAME])?;
+            // A stale unit file the manager never loaded can't be
+            // disabled — remove it anyway or a failed install can never
+            // be cleaned up.
+            if let Err(e) = systemd_run(&["disable", "--now", NAME]) {
+                if !matches!(unit_load_state(), UnitLoad::NotFound) {
+                    return Err(e);
+                }
+            }
             let _ = std::fs::remove_file(&target);
-            systemd_run(&["daemon-reload"])?;
+            let _ = systemd_run(&["daemon-reload"]);
             Ok(format!("removed the systemd unit {}", target.display()))
         }
         Supervisor::None => {
