@@ -5,7 +5,13 @@ fn main() {
     // bare run prints help instead of sitting silent.
     let args: Vec<String> = std::env::args().collect();
     let subcommand_given = args.iter().skip(1).any(|a| !a.starts_with('-'));
-    if !subcommand_given {
+    // -h/--help/-V/--version go to clap; without this they fell into sidecar
+    // mode whenever stdin wasn't a terminal and printed nothing (exit 0).
+    let help_flag = args
+        .iter()
+        .skip(1)
+        .any(|a| matches!(a.as_str(), "-h" | "--help" | "-V" | "--version"));
+    if !subcommand_given && !help_flag {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
             let config = arg_after(&args, "--config")
