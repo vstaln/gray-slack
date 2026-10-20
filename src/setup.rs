@@ -93,7 +93,7 @@ fn without_echo<T>(read: impl FnOnce() -> T) -> T {
 fn without_echo<T>(read: impl FnOnce() -> T) -> T {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
     };
     unsafe {
         let handle = GetStdHandle(STD_INPUT_HANDLE);
