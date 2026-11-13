@@ -29,7 +29,10 @@ pub enum Command {
     /// allowlist collected, home channel is your DM with the bot.
     Setup,
     Run,
-    Sidecar,
+    Sidecar {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
+    },
     /// Print the plugin manifest (what `gray plugin install slack` reads).
     #[command(hide = true)]
     Manifest,
@@ -260,7 +263,16 @@ fn allowlist(action: &AllowlistAction, config_path: &Path) -> Result<(), String>
 /// Dispatch a parsed subcommand.
 pub fn run(cmd: &Command, config_path: &Path) -> Result<(), String> {
     match cmd {
-        Command::Sidecar => crate::sidecar::serve(config_path),
+        Command::Sidecar { args } => {
+            if args.is_empty() {
+                crate::sidecar::serve(config_path)
+            } else {
+                let argv = std::iter::once("gray-slack".to_string()).chain(args.iter().cloned());
+                let cli = Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+                let cfg = cli.config.unwrap_or_else(|| config_path.to_path_buf());
+                run(&cli.command, &cfg)
+            }
+        }
         Command::Manifest => {
             use clap::CommandFactory;
             let mut m = crate::sidecar::MANIFEST.clone();
