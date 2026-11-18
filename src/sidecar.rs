@@ -12,7 +12,8 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "protocol": "1.1",
         "requires_plugins": ["gateway"],
         "description": "send and read Slack messages",
-        "commands": [],
+        "commands": ["/slack"],
+        "command_descriptions": {"/slack": "set up and manage the Slack gateway"},
         "hooks": ["prompt/context"],
         "tools": [{
             "name": "slack_send",
@@ -79,6 +80,9 @@ pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value
     if method == "prompt/context" {
         return json!({"text": PROMPT_CONTEXT});
     }
+    if method == "command/run" {
+        return run_command(params, config_path);
+    }
     if method == "tool/call" {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         return match name {
@@ -88,6 +92,68 @@ pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value
         };
     }
     json!({"error": "Unsupported method"})
+}
+
+fn run_command(params: &Value, config_path: &Path) -> Value {
+    let mut args: Vec<String> = params
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let head = args.first().map(String::as_str);
+    if matches!(head, Some("setup")) || (args.is_empty() && !configured(config_path)) {
+        if args.is_empty() {
+            args.push("setup".to_string());
+        }
+        return json!({
+            "terminal": args,
+            "text": "/slack setup needs an interactive terminal"
+        });
+    }
+    if matches!(head, Some("run" | "sidecar")) {
+        return json!({ "text": "Run `gray slack run` in a terminal." });
+    }
+    if args.is_empty() {
+        args.push("status".to_string());
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return json!({ "text": "cannot locate gray-slack binary" });
+    };
+    match std::process::Command::new(exe)
+        .arg("--config")
+        .arg(config_path)
+        .args(&args)
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = [stdout.trim(), stderr.trim()]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let text = if combined.is_empty() {
+                if out.status.success() {
+                    "ok".to_string()
+                } else {
+                    format!("exited with {}", out.status)
+                }
+            } else {
+                combined
+            };
+            json!({ "text": text })
+        }
+        Err(e) => json!({ "text": format!("failed to run command: {e}") }),
+    }
+}
+
+fn configured(config_path: &Path) -> bool {
+    crate::config::load_config(config_path).is_ok()
 }
 
 /// The calling session's working directory, falling back to the sidecar's.
