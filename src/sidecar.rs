@@ -11,6 +11,7 @@ pub static MANIFEST: LazyLock<Value> = LazyLock::new(|| {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
         "requires_plugins": ["gateway"],
+        "description": "send and read Slack messages",
         "commands": ["/slack"],
         "command_descriptions": {"/slack": "set up and manage the Slack gateway"},
         "hooks": ["prompt/context"],
