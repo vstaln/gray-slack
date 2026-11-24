@@ -91,7 +91,7 @@ pub async fn dispatch(method: &str, params: &Value, config_path: &Path) -> Value
             _ => is_error(),
         };
     }
-    json!({"error": "Unsupported method"})
+    json!({"error": {"code": -32601, "message": format!("method not found: {method}")}})
 }
 
 fn run_command(params: &Value, config_path: &Path) -> Value {
@@ -414,7 +414,10 @@ pub fn serve(config_path: &Path) -> ! {
             _ => json!({}),
         };
         let result = rt.block_on(dispatch(method, &params, config_path));
-        let row = json!({"id": id, "result": result});
+        let row = match result.get("error").filter(|e| e.get("code").is_some()) {
+            Some(error) => json!({"id": id, "error": error}),
+            None => json!({"id": id, "result": result}),
+        };
         if writeln!(out, "{row}").is_err() {
             std::process::exit(1);
         }
